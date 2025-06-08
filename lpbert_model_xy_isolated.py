@@ -8,6 +8,8 @@ train_lpbert_xy_ddp.py
 - 添加验证集（固定mask 60-74天）
 - 统一数据格式（1-based索引，201作为mask token）
 - 改进的训练策略
+- 使用官方 Geo-BLEU 和 DTW 实现
+- 训练完成后再验证，避免训练过程中的验证开销
 
 使用方法：
 1. 先运行单GPU预处理：
@@ -43,6 +45,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.cuda.amp import autocast, GradScaler
+from scipy import stats
 
 # ------------------------------
 # 1. 参数解析
@@ -123,12 +126,16 @@ def parse_args():
         help="每多少个batch计算一次Geo-BLEU"
     )
     parser.add_argument(
-        "--val_interval", type=int, default=500,
-        help="每多少个batch在验证集上评估"
-    )
-    parser.add_argument(
         "--geo_bleu_n", type=int, default=4,
         help="Geo-BLEU的最大n-gram"
+    )
+    parser.add_argument(
+        "--val_sample_ratio", type=float, default=1.0,
+        help="验证时采样比例，用于加速验证（1.0表示全部验证）"
+    )
+    parser.add_argument(
+        "--compute_dtw", action="store_true",
+        help="是否计算DTW（DTW计算较慢）"
     )
     
     # 学习率调度器参数
@@ -136,29 +143,147 @@ def parse_args():
         "--scheduler_type", type=str, default="cosine", choices=["cosine", "plateau"],
         help="学习率调度器类型"
     )
+    
+    # 验证相关参数
+    parser.add_argument(
+        "--final_validation", action="store_true", default=True,
+        help="是否在训练结束后进行最终验证"
+    )
+    parser.add_argument(
+        "--save_every", type=int, default=10,
+        help="每多少个epoch保存一次checkpoint"
+    )
 
     return parser.parse_args()
 
 # ------------------------------
-# 2. Geo-BLEU 计算（针对x,y分离）
+# 2. 官方 Geo-BLEU 和 DTW 实现
 # ------------------------------
 
-def extract_ngrams(sequence, n):
-    """提取序列的n-gram"""
-    ngrams = []
-    for i in range(len(sequence) - n + 1):
-        ngram = tuple(sequence[i:i+n])
-        ngrams.append(ngram)
-    return ngrams
+def gen_ngram_list(seq, n):
+    """生成n-gram列表"""
+    ngram_list = list()
+    if len(seq) < n:
+        return ngram_list
 
-def compute_geo_bleu_xy(pred_x_sequences, pred_y_sequences, target_x_sequences, target_y_sequences, max_n=4):
+    for i in range(len(seq) - n + 1):
+        ngram = seq[i: i + n]
+        ngram_list.append(ngram)
+
+    return ngram_list
+
+def calc_distance(point1, point2, scale_factor=1.):
+    """计算两点之间的欧氏距离"""
+    x_diff = point2[0] - point1[0]
+    y_diff = point2[1] - point1[1]
+    return np.sqrt(x_diff ** 2. + y_diff ** 2.) / scale_factor
+
+def calc_point_proximity(point1, point2, beta):
+    """计算两点之间的邻近性得分"""
+    distance = calc_distance(point1, point2)
+    return np.exp(-beta * distance)
+
+def calc_ngram_proximity(ngram1, ngram2, beta):
+    """计算两个n-gram之间的邻近性得分"""
+    point_proximity_list = list()
+    for point1, point2 in zip(ngram1, ngram2):
+        point_proximity_list.append(calc_point_proximity(point1, point2, beta))
+    
+    return np.prod(point_proximity_list)
+
+def calc_geo_p_n(sys_seq, ans_seq, n, beta):
+    """计算Geo-BLEU的p_n值（官方实现）"""
+    sys_ngram_list = gen_ngram_list(sys_seq, n)
+    ans_ngram_list = gen_ngram_list(ans_seq, n)
+
+    edge_list = list()
+    for sys_id, sys_ngram in enumerate(sys_ngram_list):
+        for ans_id, ans_ngram in enumerate(ans_ngram_list):
+            ngram_pair = (sys_id, ans_id)
+            proximity = calc_ngram_proximity(sys_ngram, ans_ngram, beta)
+            edge_list.append((ngram_pair, proximity))
+   
+    edge_list.sort(key=lambda x: x[1], reverse=True)
+    proximity_sum = 0.
+    proximity_cnt = 0
+
+    while len(edge_list) > 0:
+        best_edge = edge_list[0]
+        best_edge_ngram_pair = best_edge[0]
+        proximity = best_edge[1]
+        
+        proximity_sum += proximity
+        proximity_cnt += 1
+        best_edge_sys_id, best_edge_ans_id = best_edge_ngram_pair
+        
+        new_edge_list = list()
+        for edge in edge_list:
+            ngram_pair = edge[0]
+            sys_id, ans_id = ngram_pair
+            if sys_id == best_edge_sys_id:
+                continue
+            if ans_id == best_edge_ans_id:
+                continue
+                
+            new_edge_list.append(edge)
+            
+        edge_list = new_edge_list
+    
+    geo_p_n = proximity_sum / float(proximity_cnt) if proximity_cnt > 0 else 0.0
+    
+    return geo_p_n
+
+def calc_geobleu_orig(sys_seq, ans_seq, max_n=3, beta=0.5, weights=None):
+    """计算单个序列的Geo-BLEU（官方实现）"""
+    p_n_list = list()
+    seq_len_min = min(len(sys_seq), len(ans_seq))
+    max_n_alt = min(max_n, seq_len_min)
+
+    for i in range(1, max_n_alt + 1):
+        p_n = calc_geo_p_n(sys_seq, ans_seq, i, beta)
+        p_n_list.append(p_n)
+    
+    if not p_n_list:
+        return 0.0
+        
+    brevity_penalty = 1. if len(sys_seq) > len(ans_seq) \
+        else np.exp(1. - len(ans_seq) / float(len(sys_seq)))
+    
+    # 使用scipy的几何平均
+    geo_mean = stats.mstats.gmean(p_n_list) if all(p > 0 for p in p_n_list) else 0.0
+    
+    return brevity_penalty * geo_mean
+
+def calc_dtw_orig(sys_seq, ans_seq, scale_factor=1.):
+    """计算DTW距离（官方实现）"""
+    n, m = len(sys_seq), len(ans_seq)
+    dtw_matrix = np.zeros((n + 1, m + 1))
+
+    for i in range(n + 1):
+        for j in range(m + 1):
+            dtw_matrix[i, j] = np.inf
+    dtw_matrix[0, 0] = 0
+
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            cost = calc_distance(sys_seq[i - 1], ans_seq[j - 1], scale_factor=scale_factor)
+            last_min = np.min([dtw_matrix[i - 1, j], dtw_matrix[i, j - 1], dtw_matrix[i - 1, j - 1]])
+            dtw_matrix[i, j] = cost + last_min
+    
+    return dtw_matrix[-1, -1]
+
+def compute_geo_bleu_dtw_xy(pred_x_sequences, pred_y_sequences, target_x_sequences, target_y_sequences, 
+                            max_n=3, beta=0.5, dtw_scale_factor=2.0, compute_dtw=True):
     """
-    计算基于(x,y)坐标对的Geo-BLEU分数
+    计算基于(x,y)坐标对的Geo-BLEU和DTW分数（使用官方实现）
+    
+    返回: (geo_bleu_score, dtw_score)
     """
     if len(pred_x_sequences) == 0 or len(target_x_sequences) == 0:
-        return 0.0
+        return 0.0, 0.0
     
-    bleu_scores = []
+    geo_bleu_scores = []
+    dtw_scores = []
     
     for pred_x, pred_y, target_x, target_y in zip(pred_x_sequences, pred_y_sequences, 
                                                    target_x_sequences, target_y_sequences):
@@ -167,45 +292,28 @@ def compute_geo_bleu_xy(pred_x_sequences, pred_y_sequences, target_x_sequences, 
         target_seq = [(x, y) for x, y in zip(target_x, target_y)]
         
         if len(pred_seq) == 0 or len(target_seq) == 0:
-            bleu_scores.append(0.0)
+            geo_bleu_scores.append(0.0)
+            dtw_scores.append(0.0)
             continue
-            
-        # 计算不同n-gram的精度
-        precisions = []
         
-        for n in range(1, min(max_n + 1, len(pred_seq) + 1)):
-            pred_ngrams = extract_ngrams(pred_seq, n)
-            target_ngrams = extract_ngrams(target_seq, n)
-            
-            if len(pred_ngrams) == 0:
-                precisions.append(0.0)
-                continue
-            
-            # 计算n-gram匹配数
-            target_ngram_counts = Counter(target_ngrams)
-            matches = 0
-            
-            for ngram in pred_ngrams:
-                if target_ngram_counts[ngram] > 0:
-                    matches += 1
-                    target_ngram_counts[ngram] -= 1
-            
-            precision = matches / len(pred_ngrams) if len(pred_ngrams) > 0 else 0.0
-            precisions.append(precision)
+        # 计算Geo-BLEU
+        geo_bleu = calc_geobleu_orig(pred_seq, target_seq, max_n=max_n, beta=beta)
+        geo_bleu_scores.append(geo_bleu)
         
-        # 计算几何平均
-        if precisions and all(p > 0 for p in precisions):
-            log_precision = sum(np.log(p) for p in precisions) / len(precisions)
-            geo_mean = np.exp(log_precision)
+        # 计算DTW（可选，因为DTW计算也比较慢）
+        if compute_dtw:
+            dtw = calc_dtw_orig(pred_seq, target_seq, scale_factor=dtw_scale_factor)
+            dtw_scores.append(dtw)
         else:
-            geo_mean = 0.0
-        
-        bleu_scores.append(geo_mean)
+            dtw_scores.append(0.0)
     
-    return np.mean(bleu_scores) if bleu_scores else 0.0
+    avg_geo_bleu = np.mean(geo_bleu_scores) if geo_bleu_scores else 0.0
+    avg_dtw = np.mean(dtw_scores) if dtw_scores and compute_dtw else 0.0
+    
+    return avg_geo_bleu, avg_dtw
 
 # ------------------------------
-# 3. 数据预处理（改进版）
+# 3. 数据预处理（保持不变）
 # ------------------------------
 
 def load_raw_data(csv_path):
@@ -328,7 +436,7 @@ def generate_masked_sequences(user2seq, users, mask_start=60, mask_end=74, cache
     return user2inputseq, user2targetseq
 
 # ------------------------------
-# 4. Dataset 定义（改进版）
+# 4. Dataset 定义（保持不变）
 # ------------------------------
 
 class LPBertTrainDatasetXY(Dataset):
@@ -364,7 +472,7 @@ class LPBertValTestDatasetXY(Dataset):
         return input_seq, target_seq
 
 # ------------------------------
-# 5. Collate 函数（X/Y分离版本）
+# 5. Collate 函数（保持不变）
 # ------------------------------
 
 def collate_fn_train_xy(batch_list, mask_days=15, val_mask_prob=0.3):
@@ -566,7 +674,7 @@ def collate_fn_val_test_xy(batch_list):
     }
 
 # ------------------------------
-# 6. 模型定义（X/Y分离版本）
+# 6. 模型定义（保持不变）
 # ------------------------------
 
 class LPBertModelXY(nn.Module):
@@ -672,8 +780,8 @@ def compute_loss_xy(logits_x, logits_y, target_x, target_y, pred_mask):
     
     return loss_x + loss_y
 
-def evaluate_batch_geo_bleu_xy(model, batch_data, device):
-    """评估一个batch的GEO-BLEU（X/Y版本）"""
+def evaluate_batch_geo_bleu_dtw_xy(model, batch_data, device, compute_dtw=True):
+    """评估一个batch的GEO-BLEU和DTW（X/Y版本）"""
     model.eval()
     
     with torch.no_grad():
@@ -714,19 +822,21 @@ def evaluate_batch_geo_bleu_xy(model, batch_data, device):
                 valid_indices = [(j, tx, ty) for j, (tx, ty) in enumerate(zip(true_x_seq, true_y_seq)) if tx >= 0 and ty >= 0]
                 if valid_indices:
                     indices = [j for j, _, _ in valid_indices]
-                    pred_x_seqs.append([pred_x_seq[j] for j in indices])
-                    pred_y_seqs.append([pred_y_seq[j] for j in indices])
-                    true_x_seqs.append([tx for _, tx, _ in valid_indices])
-                    true_y_seqs.append([ty for _, _, ty in valid_indices])
+                    # 注意：模型输出是0-199，需要转换回1-200
+                    pred_x_seqs.append([pred_x_seq[j] + 1 for j in indices])
+                    pred_y_seqs.append([pred_y_seq[j] + 1 for j in indices])
+                    true_x_seqs.append([tx + 1 for _, tx, _ in valid_indices])
+                    true_y_seqs.append([ty + 1 for _, _, ty in valid_indices])
         
-        # 计算GEO-BLEU
-        geo_bleu = compute_geo_bleu_xy(pred_x_seqs, pred_y_seqs, true_x_seqs, true_y_seqs)
+        # 计算GEO-BLEU和DTW
+        geo_bleu, dtw = compute_geo_bleu_dtw_xy(pred_x_seqs, pred_y_seqs, true_x_seqs, true_y_seqs, 
+                                                compute_dtw=compute_dtw)
     
     model.train()
-    return geo_bleu
+    return geo_bleu, dtw
 
 # ------------------------------
-# 7. Checkpoint 管理
+# 7. Checkpoint 管理（更新以包含DTW）
 # ------------------------------
 
 def find_latest_checkpoint(cache_dir):
@@ -751,8 +861,8 @@ def find_latest_checkpoint(cache_dir):
     
     return os.path.join(cache_dir, latest_file), latest_epoch
 
-def save_checkpoint(model, optimizer, scheduler, epoch, loss, geo_bleu, val_geo_bleu, args, cache_dir):
-    """保存checkpoint"""
+def save_checkpoint(model, optimizer, scheduler, epoch, loss, geo_bleu, dtw, args, cache_dir):
+    """保存checkpoint（包含DTW）"""
     model_to_save = model.module if hasattr(model, 'module') else model
     checkpoint_path = os.path.join(cache_dir, f"checkpoint_epoch{epoch}.pt")
     
@@ -763,14 +873,86 @@ def save_checkpoint(model, optimizer, scheduler, epoch, loss, geo_bleu, val_geo_
         'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
         'loss': loss,
         'geo_bleu': geo_bleu,
-        'val_geo_bleu': val_geo_bleu,
+        'dtw': dtw,
         'args': vars(args)
     }, checkpoint_path)
     
     return checkpoint_path
 
+def run_validation(model, val_loader, device, args, rank):
+    """运行完整的验证"""
+    if rank == 0:
+        print(f"\n[INFO] 开始验证集评估...")
+        print(f"[INFO] 验证设置:")
+        print(f"  - 采样比例: {args.val_sample_ratio*100:.0f}%")
+        print(f"  - 计算DTW: {args.compute_dtw}")
+    
+    model.eval()
+    val_geo_bleu_sum = 0.0
+    val_dtw_sum = 0.0
+    val_loss_sum = 0.0
+    val_batches = 0
+    
+    # 采样验证以加速
+    total_val_batches = len(val_loader)
+    sample_val_batches = max(1, int(total_val_batches * args.val_sample_ratio))
+    
+    with torch.no_grad():
+        for batch_idx, batch_data in enumerate(tqdm(val_loader, desc="验证", 
+                                                   total=sample_val_batches, 
+                                                   disable=(rank != 0))):
+            if batch_idx >= sample_val_batches:
+                break
+                
+            if batch_data is None:
+                continue
+            
+            # 数据到GPU
+            for key in batch_data:
+                if torch.is_tensor(batch_data[key]):
+                    batch_data[key] = batch_data[key].to(device)
+            
+            # 计算损失
+            logits_x, logits_y = model(
+                batch_data['d'], batch_data['t'], 
+                batch_data['x'], batch_data['y'], 
+                batch_data['delta'], batch_data['padding_mask']
+            )
+            
+            loss = compute_loss_xy(
+                logits_x, logits_y,
+                batch_data['target_x'], batch_data['target_y'],
+                batch_data['pred_mask']
+            )
+            
+            # 计算指标
+            geo_bleu, dtw = evaluate_batch_geo_bleu_dtw_xy(model, batch_data, device,
+                                                           compute_dtw=args.compute_dtw)
+            
+            val_loss_sum += loss.item()
+            val_geo_bleu_sum += geo_bleu
+            val_dtw_sum += dtw
+            val_batches += 1
+    
+    # 计算平均值
+    val_loss = val_loss_sum / max(1, val_batches)
+    val_geo_bleu = val_geo_bleu_sum / max(1, val_batches)
+    val_dtw = val_dtw_sum / max(1, val_batches) if args.compute_dtw else 0.0
+    
+    if rank == 0:
+        print(f"\n[INFO] 验证结果:")
+        print(f"  - 验证损失: {val_loss:.4f}")
+        print(f"  - 验证 GEO-BLEU: {val_geo_bleu:.4f}")
+        if args.compute_dtw:
+            print(f"  - 验证 DTW: {val_dtw:.2f}")
+        if args.val_sample_ratio < 1.0:
+            print(f"  - (使用了 {args.val_sample_ratio*100:.0f}% 的验证数据)")
+    
+    model.train()
+    return val_loss, val_geo_bleu, val_dtw
+
 # ------------------------------
-# 8. 主函数
+# 8. 主函数（更新：训练完成后验证）
 # ------------------------------
 
 def main():
@@ -937,8 +1119,6 @@ def main():
     if rank == 0:
         print(f"[INFO] 开始训练...")
     
-    best_val_geo_bleu = 0.0
-    
     for epoch in range(start_epoch, args.epochs):
         if train_sampler:
             train_sampler.set_epoch(epoch)
@@ -946,6 +1126,7 @@ def main():
         model.train()
         epoch_loss = 0.0
         epoch_geo_bleu = 0.0
+        epoch_dtw = 0.0
         num_batches = 0
         num_eval_batches = 0
         
@@ -987,9 +1168,10 @@ def main():
             epoch_loss += loss.item()
             num_batches += 1
             
-            # 定期评估
+            # 定期评估训练集上的指标
             if batch_idx > 0 and batch_idx % args.eval_interval == 0:
-                geo_bleu = evaluate_batch_geo_bleu_xy(model, batch_data, device)
+                geo_bleu, dtw = evaluate_batch_geo_bleu_dtw_xy(model, batch_data, device, 
+                                                               compute_dtw=False)  # 训练时不计算DTW
                 epoch_geo_bleu += geo_bleu
                 num_eval_batches += 1
                 
@@ -1007,60 +1189,57 @@ def main():
         avg_loss = epoch_loss / max(1, num_batches)
         avg_geo_bleu = epoch_geo_bleu / max(1, num_eval_batches)
         
-        # 验证集评估
-        if rank == 0:
-            print(f"\n[INFO] 在验证集上评估...")
-        
-        model.eval()
-        val_geo_bleu_sum = 0.0
-        val_batches = 0
-        
-        with torch.no_grad():
-            for batch_data in tqdm(val_loader, desc="验证", disable=(rank != 0)):
-                if batch_data is None:
-                    continue
-                
-                for key in batch_data:
-                    if torch.is_tensor(batch_data[key]):
-                        batch_data[key] = batch_data[key].to(device)
-                
-                geo_bleu = evaluate_batch_geo_bleu_xy(model, batch_data, device)
-                val_geo_bleu_sum += geo_bleu
-                val_batches += 1
-        
-        val_geo_bleu = val_geo_bleu_sum / max(1, val_batches)
-        
         # 调整学习率
         if args.scheduler_type == "cosine":
             scheduler.step()
         else:
             scheduler.step(avg_loss)
         
-        # 保存checkpoint
+        # 定期保存checkpoint
         if rank == 0:
-            print(f"\n[Epoch {epoch+1}] 训练损失: {avg_loss:.4f}, 训练GEO-BLEU: {avg_geo_bleu:.4f}, 验证GEO-BLEU: {val_geo_bleu:.4f}")
+            print(f"\n[Epoch {epoch+1}] 训练损失: {avg_loss:.4f}, 训练GEO-BLEU: {avg_geo_bleu:.4f}")
             
-            checkpoint_path = save_checkpoint(
-                model, optimizer, scheduler, epoch + 1,
-                avg_loss, avg_geo_bleu, val_geo_bleu,
-                args, args.cache_dir
-            )
-            print(f"[INFO] 保存checkpoint: {checkpoint_path}")
-            
-            # 保存最佳模型
-            if val_geo_bleu > best_val_geo_bleu:
-                best_val_geo_bleu = val_geo_bleu
-                best_path = os.path.join(args.cache_dir, "best_model.pt")
-                torch.save(model.module.state_dict() if hasattr(model, 'module') else model.state_dict(), best_path)
-                print(f"[INFO] 保存最佳模型，验证GEO-BLEU: {best_val_geo_bleu:.4f}")
+            if (epoch + 1) % args.save_every == 0:
+                checkpoint_path = save_checkpoint(
+                    model, optimizer, scheduler, epoch + 1,
+                    avg_loss, avg_geo_bleu, 0.0, args, args.cache_dir
+                )
+                print(f"[INFO] 保存checkpoint: {checkpoint_path}")
+    
+    # 训练完成后的最终验证
+    if args.final_validation and rank == 0:
+        print("\n" + "="*80)
+        print("训练完成！开始最终验证...")
+        print("="*80)
+        
+        val_loss, val_geo_bleu, val_dtw = run_validation(model, val_loader, device, args, rank)
+        
+        # 保存最终模型
+        final_model_path = os.path.join(args.cache_dir, "final_model.pt")
+        torch.save(model.module.state_dict() if hasattr(model, 'module') else model.state_dict(), 
+                  final_model_path)
+        print(f"\n[INFO] 保存最终模型: {final_model_path}")
+        
+        # 保存最终结果
+        results = {
+            'final_epoch': args.epochs,
+            'val_loss': val_loss,
+            'val_geo_bleu': val_geo_bleu,
+            'val_dtw': val_dtw,
+            'args': vars(args)
+        }
+        
+        results_path = os.path.join(args.cache_dir, "final_results.json")
+        with open(results_path, 'w') as f:
+            json.dump(results, f, indent=2)
+        print(f"[INFO] 保存最终结果: {results_path}")
     
     # 清理
     if world_size > 1:
         dist.destroy_process_group()
     
     if rank == 0:
-        print("\n[INFO] 训练完成!")
-        print(f"[INFO] 最佳验证GEO-BLEU: {best_val_geo_bleu:.4f}")
+        print("\n[INFO] 训练流程完成!")
 
 if __name__ == "__main__":
     main()
