@@ -1,0 +1,1 @@
+Preparation for Geospatial competition 2025

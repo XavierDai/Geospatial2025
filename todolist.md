@@ -14,6 +14,6 @@ git status
 
 git add .
 
-git commit -m "update description"
+git commit -m "update"
 
 git push
