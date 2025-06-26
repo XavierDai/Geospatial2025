@@ -1,4 +1,6 @@
 ### To do list:
+- [ ] NYU VPN
+- [ ] NYU GPU
 - [x] official GEO-BLEU and DTW
 - [x] 2023 task1: LP-BERT
 - [ ] 2024 LlaMa solution
