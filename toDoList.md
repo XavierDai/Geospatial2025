@@ -1,11 +1,14 @@
 ### To do list:
 - [x] NYU VPN
-- [x] NYU GPU
+- [x] NYU GPU setting up
 - [x] official GEO-BLEU and DTW
 - [x] 2023 task1: LP-BERT
 - [x] 2024 LlaMa solution
 - [x] 2024 LP-BERT solution
-- [ ] ...
+- [x] 2024 Lit review: MoE BERT, City Aware BERT, Statistic Probability Mapping with time decay, ...
+- [x] 2025 proposed solution
+- [x] 2025 proposed benchmark
+- [ ] EXPERIMENT: 2025 LLM with feature engineering
 
 
 ---
