@@ -4,7 +4,7 @@
 - [x] official GEO-BLEU and DTW
 - [x] 2023 task1: LP-BERT
 - [x] 2024 LlaMa solution
-- [ ] ...
+- [x] 2024 LP-BERT solution
 - [ ] ...
 
 
